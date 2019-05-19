@@ -1,0 +1,928 @@
+---
+title: "Advanced R - Individual Project"
+author: "Martin da Costa Louzada"
+date: "May 23rd 2019"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE)
+```
+
+# Black Friday Dataset Analysis and Purchase Prediction
+
+## Introduction
+
+## Loading Libraries
+```{r}
+# Data Munging Libraries
+library(data.table)
+library(lubridate)
+library(dplyr)
+
+# Plotting Libraries
+library(ggplot2)
+options(scipen = 999)
+theme_set(theme_minimal(base_size = 16))
+library(ggrepel)
+library(ggiraph)
+library(plotly)
+library(corrplot)
+library(visNetwork)
+library(gridExtra)
+library(cowplot)
+
+# Machine Learning Libraries
+library(FSelector)
+library(e1071)
+library(glmnet)
+library(caret)
+library(randomForest)
+library(xgboost)
+library(dummies)
+library(rpart)
+library(partykit)
+library(rpart.plot)
+
+```
+
+## Functions
+
+```{r}
+# Function to split a dataset into training and validation.
+f_partition<-function(df,val_proportion=0.2, seed=NULL){
+  
+  if(!is.null(seed)) set.seed(seed)
+  
+  train_index<-sample(nrow(df), floor(nrow(df)*(1-val_proportion)), replace = FALSE)
+  df_train<-df[train_index]
+  df_val<-df[-train_index]
+  
+  return(list(train=df_train, val=df_val))
+}
+
+# Mean Absolute Error
+mae<-function(real, predicted){
+  return(mean(abs(real-predicted)))
+}
+
+# Mean Absolute Percentage Error
+mape<-function(real,predicted){
+  return(mean(abs((real-predicted)/real)))
+}
+
+# Root Mean Square Error
+rmse<-function(real,predicted){
+  return(sqrt(mean((real-predicted)^2)))
+}
+
+```
+
+## Data Reading and Preparation
+The dataset is offered in two separated fields, one for the training and another one for the test set.
+
+```{r Load Data}
+original_training_data <- fread("BlackFriday_train.csv")
+original_test_data <- fread("BlackFriday_test.csv")
+
+```
+
+Join both datasets to avoid applying the Feature Engineering process two times
+```{r Join Datasets}
+original_test_data$Purchase <- 0 #create Purchase column in test df to allow joining
+dataset <- rbind(original_training_data, original_test_data)
+```
+
+Let's now visualize the dataset to see where to begin
+```{r Dataset Visualization}
+head(dataset,5)
+summary(dataset)
+str(dataset)
+```
+
+We can already see that features "User_ID", "Occupation", "Marital Status" and the "Product_Categories" are incorrectly classified as Integers, so we will Factorize those features before starting the analysis.
+```{r Factorize Features}
+dataset[ , which(sapply(dataset, is.integer)):=lapply(.SD, factor), .SDcols = sapply(dataset, is.integer)]
+dataset[ , which(sapply(dataset, is.character)):=lapply(.SD, factor), .SDcols = sapply(dataset, is.character)]
+
+str(dataset)      
+```
+
+## Exploratory Data Analysis
+Now let's take a deeper look at the dataset to try to understand and identify some useful patterns
+
+### Target Variable
+First, we will analyze our target variable for this exercise, Purchase, using only the original train set:
+
+```{r Purchase Summary}
+print(sprintf("Total number of purchases: %d", nrow(original_training_data)))
+print(sprintf("Total Amount in purchases: %f", round(sum(original_training_data$Purchase)),1))
+
+summary(original_training_data$Purchase)
+```
+There were 483.819 purchases with a mean value of 9.332 and median 8.061. They sum up to 4.515.210.560! The lowest amount for a purchase was 185 while the highest was 23.961. Let's plot a histogram to better visualize the distribution:
+
+```{r Purchase Amount Histogram}
+ggplot(original_training_data, aes(Purchase)) +
+    geom_histogram(aes(y = ..density..)) + geom_density(col="red") +
+    labs(title = "Purchase Amount Distribution") + xlab("Purchase Amount") +
+    theme(axis.text.x = element_text(angle=45, size=10), axis.title.x = element_text(size=11), axis.text.y = element_blank())
+```
+The distribution of Purchase Amount resembles a multimodal distribution, with peaks at 5.000, 8.000 and 15.000.
+
+
+### Categorical Variables
+Now let's analyze the other variables of the dataset.
+
+```{r User_ID}
+print(sprintf("Number of Distinct Users: %d", length(levels(dataset$User_ID))))
+print(sprintf("Average number of purchases per User: %f", nrow(dataset)/length(levels(dataset$User_ID))))
+print(sprintf("Average amount of spent per User: %f", sum(dataset$Purchase)/length(levels(dataset$User_ID))))
+print("Users with most Purchases:")
+dataset[,.(number_of_Purchases = .N), by="User_ID"][order(number_of_Purchases, decreasing=TRUE)][1:10]
+print("Users that spent the most in total:")
+dataset[,.(Total_Amount = sum(Purchase)), by="User_ID"][order(Total_Amount, decreasing=TRUE)][1:10]
+print("Users with highest average Ticket:")
+dataset[,.(Avg_Ticket = mean(Purchase), n=.N), by="User_ID"][order(Avg_Ticket, decreasing=TRUE)][1:10]
+```
+```{r Gender}
+dataset_gender = as.data.table(dataset %>%
+                    select(User_ID, Gender) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+ggplot(data = dataset_gender) +
+                geom_bar(mapping = aes(x = Gender, y = ..count.., fill = Gender)) +
+                labs(title = 'Gender of Customers') + 
+                scale_fill_brewer(palette = 'PuBuGn')
+
+dataset_gender[,.(n=.N, perc = .N/nrow(dataset_gender)), by="Gender"]
+```
+
+
+There are 4.225 distinct male customers (71.72%) and 1.666 female ones (28.28%) in the database.
+
+```{r Gender Purchase Amount}
+total_purchase_user = original_training_data %>%
+                        select(User_ID, Gender, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_gender = original_training_data %>%
+                select(User_ID, Gender) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_gender = full_join(total_purchase_user, user_gender, by = "User_ID")
+
+average_spending_gender = user_purchase_gender %>%
+                            group_by(Gender) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), 
+                                      Average = Purchase/Count)
+head(average_spending_gender)
+
+ggplot(data = average_spending_gender) +
+                    geom_bar(mapping = aes(x = Gender, y = Average, fill = Gender), stat = 'identity') +
+                    labs(title = 'Average Spending by Gender') +
+                    scale_fill_brewer(palette = 'PuBuGn')
+```
+
+The average spending amount for Male customers was 820579.5 and for females 629208.9.
+
+
+```{r Age}
+dataset_age = as.data.table(dataset %>%
+                    select(User_ID, Age) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+ggplot(data = dataset_age) +
+                geom_bar(mapping = aes(x = Age, y = ..count..)) +
+                labs(title = 'Age of Customers')
+
+dataset_age[,.(n=.N, perc = .N/nrow(dataset_age)), by="Age"]
+```
+The biggest customer age range is from 26-35 yo (35%), followed by 36-45 (19%) and 18-25 (18%).
+Let's look at the average spending of each age group.
+
+```{r Age Average Spendings}
+total_purchase_user = original_training_data %>%
+                        select(User_ID, Age, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_age = original_training_data %>%
+                select(User_ID, Age) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_age = full_join(total_purchase_user, user_age, by = "User_ID")
+
+average_spending_age = user_purchase_age %>%
+                            group_by(Age) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), 
+                                      Average = Purchase/Count)
+head(average_spending_age)
+
+ggplot(data = average_spending_age) +
+                    geom_bar(mapping = aes(x = Age, y = Average), stat = 'identity') +
+                    labs(title = 'Average Spending by Age Group') 
+```
+26-35 yo also have the highest spending average. 26-45 and 18-25 yo have very similar average spending, as well as 46-50 and 51-55. The lowest ticket belongs to 55+ customers.
+
+```{r Occupation}
+dataset_occ = as.data.table(dataset %>%
+                    select(User_ID, Occupation) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+ggplot(data = dataset_occ) +
+                geom_bar(mapping = aes(x = Occupation, y = ..count..)) +
+                labs(title = 'Occupation of Customers')
+
+dataset_occ[,.(n=.N, perc = .N/nrow(dataset_occ)), by="Occupation"][order(n, decreasing=T)]
+```
+Occupation is a very granular feature, but at least 3 of them dominate the dataset, each with at least 11% of customers. Let's look at how their average spendings differ among each other before deciding on an aggregation rule.
+
+```{r Occupation Average Spendings}
+total_purchase_user = original_training_data %>%
+                        select(User_ID, Occupation, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_occ = original_training_data %>%
+                select(User_ID, Occupation) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_occ = full_join(total_purchase_user, user_occ, by = "User_ID")
+
+average_spending_occ = user_purchase_occ %>%
+                            group_by(Occupation) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), perc = n()/nrow(dataset_occ),
+                                      Average = Purchase/Count)
+head(average_spending_occ)
+
+ggplot(data = average_spending_occ) +
+                    geom_bar(mapping = aes(x = Occupation, y = Average), stat = 'identity') +
+                    labs(title = 'Average Spending by Occupation') 
+```
+Occupations have similar spending averages with the exception of 3 levels which present much lower values, and other 3 with a bit higher averages.
+Let's plot the participation of each occupation in the dataset with their spending averages to see how we can group them.
+
+```{r Occupation Aggregation}
+ggplot(data = average_spending_occ, aes(Count, Average, label = as.character(Occupation))) + geom_point(mapping = aes(x=Count, y = Average)) + geom_text(aes(label=Occupation), size=5)
+```
+Based on this visualization, we will keep the Occupations with high participation in the dataset as stand alone groups and group the others according to similar spending averages. Let's do that afterwards.
+
+
+```{r City}
+dataset_city = as.data.table(dataset %>%
+                    select(User_ID, City_Category) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+ggplot(data = dataset_city) +
+                geom_bar(mapping = aes(x = City_Category, y = ..count..)) +
+                labs(title = 'City of Customers')
+
+dataset_city[,.(n=.N, perc = .N/nrow(dataset_age)), by="City_Category"]
+```
+More than 50% of customers live in Cities from Category C.
+
+```{r City Category Purchase Amount}
+total_purchase_user = original_training_data %>%
+                        select(User_ID, City_Category, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_city = original_training_data %>%
+                select(User_ID, City_Category) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_city = full_join(total_purchase_user, user_city, by = "User_ID")
+
+average_spending_city = user_purchase_city %>%
+                            group_by(City_Category) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), 
+                                      Average = Purchase/Count)
+head(average_spending_city)
+
+ggplot(data = average_spending_city) +
+                    geom_bar(mapping = aes(x = City_Category, y = Average, fill = City_Category), stat = 'identity') +
+                    labs(title = 'Average Spending by City_Category') +
+                    scale_fill_brewer(palette = 'PuBuGn')
+```
+City Categories A and B have virtually the same average spendings per purchase, while C has a much lower one.
+
+```{r Stay in Current City}
+dataset_stay = as.data.table(dataset %>%
+                    select(User_ID, Stay_In_Current_City_Years) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+ggplot(data = dataset_stay) +
+                geom_bar(mapping = aes(x = Stay_In_Current_City_Years, y = ..count..)) +
+                labs(title = 'Customer by Years Living in the Current City') 
+
+dataset_stay[,.(n=.N, perc = .N/nrow(dataset_stay)), by="Stay_In_Current_City_Years"]
+```
+48% of customer have stayed in their current cities for just one year or less, 35% between 2 and 4 years, and 15% for more than 4 years. 
+
+```{r City Stay Purchase Amount}
+total_purchase_user = original_training_data %>%
+                        select(User_ID, Stay_In_Current_City_Years, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_citystay = original_training_data %>%
+                select(User_ID, Stay_In_Current_City_Years) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_citystay = full_join(total_purchase_user, user_citystay, by = "User_ID")
+
+average_spending_citystay = user_purchase_citystay %>%
+                            group_by(Stay_In_Current_City_Years) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), 
+                                      Average = Purchase/Count)
+head(average_spending_citystay)
+
+ggplot(data = average_spending_citystay) +
+                    geom_bar(mapping = aes(x = Stay_In_Current_City_Years, y = Average), stat = 'identity') +
+                    labs(title = 'Average Spending by Years of Stay in Current City')
+                    
+```
+The time a customer has lived in their current city doesn't seem to affect their purchases, as all categories present very similar spending averages.
+
+```{r Marital Status}
+dataset_marital = as.data.table(dataset %>%
+                    select(User_ID, Marital_Status) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+ggplot(data = dataset_marital) +
+                geom_bar(mapping = aes(x = Marital_Status, y = ..count.., fill = Marital_Status)) +
+                labs(title = 'Marital_Status of Customers') + 
+                scale_fill_brewer(palette = 'PuBuGn')
+
+dataset_marital[,.(n=.N, perc = .N/nrow(dataset_marital)), by="Marital_Status"]
+```
+Most shoppers appear to be single/unmarried.
+
+```{r Marital Status Purchase Amount}
+total_purchase_user = original_training_data %>%
+                        select(User_ID, Marital_Status, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_marital = original_training_data %>%
+                select(User_ID, Marital_Status) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_marital = full_join(total_purchase_user, user_marital, by = "User_ID")
+
+average_spending_marital = user_purchase_marital %>%
+                            group_by(Marital_Status) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), 
+                                      Average = Purchase/Count)
+head(average_spending_marital)
+
+ggplot(data = average_spending_marital) +
+                    geom_bar(mapping = aes(x = Marital_Status, y = Average), stat = 'identity') +
+                    labs(title = 'Average Spending by Marital Status')
+                    
+```
+The average spending of both single and married customers are very similar, with single ones spending slightly more.
+
+```{r Product Categories}
+dataset_cat1 = as.data.table(dataset %>%
+                    select(User_ID, Product_Category_1) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+dataset_cat2 = as.data.table(dataset %>%
+                    select(User_ID, Product_Category_2) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+dataset_cat3 = as.data.table(dataset %>%
+                    select(User_ID, Product_Category_3) %>%
+                    group_by(User_ID) %>%
+                    distinct())
+
+cat1 = ggplot(data = dataset_cat1) +
+                geom_bar(mapping = aes(x = Product_Category_1, y = ..count..)) +
+                labs(title = 'Sales of Product_Category_1') 
+
+cat2 = ggplot(data = dataset_cat2) +
+                geom_bar(mapping = aes(x = Product_Category_2, y = ..count..)) +
+                labs(title = 'Sales of Product_Category_2') 
+
+cat3 = ggplot(data = dataset_cat3) +
+                geom_bar(mapping = aes(x = Product_Category_3, y = ..count..)) +
+                labs(title = 'Sales of Product_Category_3') 
+
+plot_grid(cat1, cat2, cat3, nrow = 3)
+
+```
+
+## Data Cleaning
+
+### Missing Values
+```{r NAs discovery}
+na.cols <- which(colSums(is.na(dataset)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+sapply(dataset, function(x){sum(is.na(x))})
+```
+Let's replace those missing values in Product_Category 2 and 3 with 0, as it probably means the purchased products don't belong to any 2nd or 3rd category.
+
+``` {r replace NAs}
+#Product Category 2
+dataset$Product_Category_2_aux <- as.numeric(dataset$Product_Category_2)
+dataset$Product_Category_2_aux[which(is.na(dataset$Product_Category_2))] <- 0
+dataset$Product_Category_2 <- as.factor(dataset$Product_Category_2_aux)
+dataset$Product_Category_2_aux <- NULL
+
+#Product Category 3
+dataset$Product_Category_3_aux <- as.numeric(dataset$Product_Category_3)
+dataset$Product_Category_3_aux[which(is.na(dataset$Product_Category_3))] <- 0
+dataset$Product_Category_3 <- as.factor(dataset$Product_Category_3_aux)
+dataset$Product_Category_3_aux <- NULL
+
+
+na.cols <- which(colSums(is.na(dataset)) > 0)
+paste('Now there are', length(na.cols), 'columns with missing values')
+```
+
+### Outliers
+In this section we seek to identify outliers to then properly deal with them.
+
+```{r Outliers Detection}
+out <- boxplot.stats(dataset$Purchase, coef = 3)$out
+print(sprintf("There are %d outliers in the Purchase column",length(out)))
+```
+### Skewness
+We now need to detect skewness in the Target value. Let's see what is the effect of skewness on a variable, and plot it using ggplot.
+
+```{r Skewness}
+skewness(dataset$Purchase, na.rm = T)
+
+df_skew <- rbind(data.frame(version="Purchase",x=original_training_data$Purchase),
+            data.frame(version="log(Purchase+1)",x=log(original_training_data$Purchase + 1)))
+
+ggplot(data=df_skew) +
+  facet_wrap(~version,ncol=2,scales="free_x") +
+  geom_histogram(aes(x=x), bins = 50)
+```
+The skewness of the target variable is not so high so we will not do any transformation.
+
+## Feature Engineering and Creation
+We have already decided to group some Occupations but let's see if other categories are also very granular.
+```{r Unique values}
+sapply(dataset, function(x){length(unique(x))})
+```
+
+Let's group Occupation, according to the previous chart we generated. 
+```{r Groupping Occupation}
+ggplot(data = average_spending_occ, aes(Count, Average, label = as.character(Occupation))) + geom_point(mapping = aes(x=Count, y = Average)) + geom_text(aes(label=Occupation), size=5)
+```
+Let's keep as separate categories the most frequent ones and group the others according to similar spending average.
+Let's keep categories 4,0,7,1,17, (9, 10, 13), (12, 8, 18, 11, 15, 6, 2, 14), (19,5,3,16,3,20):
+```{r}
+dataset$Occupation_Groups <- 0
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation == 4, "A", dataset$Occupation_Groups)
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation == 0, "B", dataset$Occupation_Groups)
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation == 7, "C", dataset$Occupation_Groups)
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation == 1, "D", dataset$Occupation_Groups)
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation == 17, "E", dataset$Occupation_Groups)
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation %in% c(9,10,13), "F", dataset$Occupation_Groups)
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation %in% c(8, 18, 11, 15, 6, 2, 14,12), "G", dataset$Occupation_Groups)
+dataset[['Occupation_Groups']] <- ifelse(dataset$Occupation %in% c(19,5,3,16,3,20), "H", dataset$Occupation_Groups)
+
+dataset$Occupation_Groups <- as.factor(dataset$Occupation_Groups)
+
+total_purchase_user = dataset %>%
+                        select(User_ID, Occupation_Groups, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_occ = dataset %>%
+                select(User_ID, Occupation_Groups) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_occ = full_join(total_purchase_user, user_occ, by = "User_ID")
+
+average_spending_occ = user_purchase_occ %>%
+                            group_by(Occupation_Groups) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), perc = n()/nrow(dataset_occ),
+                                      Average = Purchase/Count)
+head(average_spending_occ)
+
+ggplot(data = average_spending_occ) +
+                    geom_bar(mapping = aes(x = Occupation_Groups, y = Average), stat = 'identity') +
+                    labs(title = 'Average Spending by Occupation') 
+```
+I'll also create a variable to indicate to how many categories each purchase belongs:
+```{r Multiple Categories}
+dataset$N_of_Categories <- 0
+dataset[["N_of_Categories"]] <- ifelse(dataset$Product_Category_2 == 0 & dataset$Product_Category_3 == 0, 1,ifelse(dataset$Product_Category_2 != 0 & dataset$Product_Category_3 == 0, 2,3))
+```
+Let's see if this variable has any impact on purchase amount:
+```{r}
+total_purchase_user = dataset %>%
+                        select(User_ID, N_of_Categories, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_occ = dataset %>%
+                select(User_ID, N_of_Categories) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_occ = full_join(total_purchase_user, user_occ, by = "User_ID")
+
+average_spending_occ = user_purchase_occ %>%
+                            group_by(N_of_Categories) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), perc = n()/nrow(dataset_occ),
+                                      Average = Purchase/Count)
+
+ggplot(data = average_spending_occ) +
+                    geom_bar(mapping = aes(x = N_of_Categories, y = Average), stat = 'identity') +
+                    labs(title = 'Average Spending by N_of_Categories') 
+```
+No difference at all!
+
+Now finally let's lower the number of product categories by groupping those with similar prices.
+```{r}
+total_purchase_user = dataset %>%
+                        select(User_ID, Product_Category_1, Purchase) %>%
+                        group_by(User_ID) %>%
+                        arrange(User_ID) %>%
+                        summarise(Total_Purchase = sum(Purchase))
+
+user_occ = dataset %>%
+                select(User_ID, Product_Category_1) %>%
+                group_by(User_ID) %>%
+                arrange(User_ID) %>%
+                distinct()
+
+user_purchase_occ = full_join(total_purchase_user, user_occ, by = "User_ID")
+
+average_spending_occ = user_purchase_occ %>%
+                            group_by(Product_Category_1) %>%
+                            summarize(Purchase = sum(as.numeric(Total_Purchase)), 
+                                      Count = n(), perc = n()/nrow(dataset_occ),
+                                      Average = Purchase/Count)
+
+average_spending_occ$Product_Category_1 <- factor(average_spending_occ$Product_Category_1, levels=average_spending_occ$Product_Category_1[order(-average_spending_occ$Average)])
+
+ggplot(data = average_spending_occ) +
+                    geom_bar(mapping = aes(x = Product_Category_1, y = Average), stat = 'identity') +
+                    labs(title = 'Average Spending by Categories') 
+```
+Let's group categories and have as final result: 9, 17, (14,18), (7,12,13,15,10), (4,16,11,3,6,2),(8,1,5)
+
+```{r Group Categories}
+dataset$Cat_1_Group <- 0
+dataset[['Cat_1_Group']] <- ifelse(dataset$Product_Category_1 == 9, "A", dataset$Cat_1_Group)
+dataset[['Cat_1_Group']] <- ifelse(dataset$Product_Category_1 == 17, "B", dataset$Cat_1_Group)
+dataset[['Cat_1_Group']] <- ifelse(dataset$Product_Category_1 %in% c(14,18), "C", dataset$Cat_1_Group)
+dataset[['Cat_1_Group']] <- ifelse(dataset$Product_Category_1 %in% c(7,12,13,15,10), "D", dataset$Cat_1_Group)
+dataset[['Cat_1_Group']] <- ifelse(dataset$Product_Category_1 %in% c(4,16,11,3,6,2), "E", dataset$Cat_1_Group)
+dataset[['Cat_1_Group']] <- ifelse(dataset$Product_Category_1 %in% c(8,1,5), "F", dataset$Cat_1_Group)
+dataset$Cat_1_Group <- as.factor(dataset$Cat_1_Group)
+
+dataset$Cat_2_Group <- 0
+dataset[['Cat_2_Group']] <- ifelse(dataset$Product_Category_2 == 9, "A", dataset$Cat_2_Group)
+dataset[['Cat_2_Group']] <- ifelse(dataset$Product_Category_2 == 17, "B", dataset$Cat_2_Group)
+dataset[['Cat_2_Group']] <- ifelse(dataset$Product_Category_2 %in% c(14,18), "C", dataset$Cat_2_Group)
+dataset[['Cat_2_Group']] <- ifelse(dataset$Product_Category_2 %in% c(7,12,13,15,10), "D", dataset$Cat_2_Group)
+dataset[['Cat_2_Group']] <- ifelse(dataset$Product_Category_2 %in% c(4,16,11,3,6,2), "E", dataset$Cat_2_Group)
+dataset[['Cat_2_Group']] <- ifelse(dataset$Product_Category_2 %in% c(8,1,5), "F", dataset$Cat_2_Group)
+dataset$Cat_2_Group <- as.factor(dataset$Cat_2_Group)
+
+dataset$Cat_3_Group <- 0
+dataset[['Cat_3_Group']] <- ifelse(dataset$Product_Category_3 == 9, "A", dataset$Cat_3_Group)
+dataset[['Cat_3_Group']] <- ifelse(dataset$Product_Category_3 == 17, "B", dataset$Cat_3_Group)
+dataset[['Cat_3_Group']] <- ifelse(dataset$Product_Category_3 %in% c(14,18), "C", dataset$Cat_3_Group)
+dataset[['Cat_3_Group']] <- ifelse(dataset$Product_Category_3 %in% c(7,12,13,15,10), "D", dataset$Cat_3_Group)
+dataset[['Cat_3_Group']] <- ifelse(dataset$Product_Category_3 %in% c(4,16,11,3,6,2), "E", dataset$Cat_3_Group)
+dataset[['Cat_3_Group']] <- ifelse(dataset$Product_Category_3 %in% c(8,1,5), "F", dataset$Cat_3_Group)
+dataset$Cat_3_Group <- as.factor(dataset$Cat_3_Group)
+```
+## Train-Validation-Test Splitting
+To facilitate the data cleaning and feature engineering we merged train and test datasets. We now split them again to create our final model.
+
+```{r Train test split}
+train <- dataset[-which(dataset$Purchase == 0),]
+test <- dataset[-which(dataset$Purchase != 0),]
+```
+
+We are going to split the annotated dataset in training and validation for the later evaluation of our models.
+```{r Train-Validation split}
+splits <- f_partition(train)
+train <- splits$train
+val <- splits$val
+```
+
+
+## Baseline Model: Linear Regression
+Let's try first a baseline model using a simple linear regression and all features.
+```{r Baseline Model}
+formula <- (Purchase ~ Gender + Age + Stay_In_Current_City_Years + Marital_Status + Occupation_Groups + Cat_1_Group + Cat_2_Group + Cat_3_Group + City_Category)
+
+
+
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     returnResamp = "all")
+
+baseline <- train(formula, 
+                       data = train, 
+                       method = "glm", 
+                       metric = "RMSE",
+                       preProc = c("center", "scale"),
+                       trControl=train_control_config)
+
+predictions_val <- predict(baseline, newdata = val)
+predictions_train <- predict(baseline, newdata = train)
+models_comparison <- data.table(model = c("baseline"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) )
+models_comparison
+```
+
+### Feature Selection: Chi-Square Selection
+```{r warning=FALSE}
+# Compute the ChiSquared Statistic over the factor features ONLY
+gc()
+features <- c("Gender", "Age" ,"Stay_In_Current_City_Years" , "Marital_Status" , "N_of_Categories" , "Occupation_Groups" , "Cat_1_Group" , "Cat_2_Group" , "Cat_3_Group")
+chisquared <- data.frame(features, statistic = sapply(features, function(x) {
+  chisq.test(train$Purchase, train[[x]])$statistic
+}))
+
+# Plot the result, and remove those below the 1st IQR (inter-quartile-range) --aggressive
+par(mfrow=c(1,2))
+boxplot(chisquared$statistic)
+bp.stats <- as.integer(boxplot.stats(chisquared$statistic)$stats)   # Get the statistics from the boxplot
+
+chisquared.threshold = bp.stats[2]  # This element represent the 1st quartile.
+text(y = bp.stats, labels = bp.stats, x = 1.3, cex=0.7)
+barplot(sort(chisquared$statistic), names.arg = chisquared$features, cex.names = 0.6, las=2, horiz = T)
+abline(v=chisquared.threshold, col='red')  # Draw a red line over the 1st IQR
+
+# Determine what features to remove from the training set.
+features_to_remove <- as.character(chisquared[chisquared$statistic < chisquared.threshold, "features"])
+
+chisq <- train(Purchase ~ Age + Stay_In_Current_City_Years + N_of_Categories + Occupation_Groups + Cat_1_Group + Cat_2_Group + Cat_3_Group, 
+                       data = train, 
+                       method = "glm", 
+                       metric = "RMSE",
+                       preProc = c("center", "scale"),
+                       trControl=train_control_config)
+
+predictions_val <- predict(chisq, newdata = val)
+predictions_train <- predict(chisq, newdata = train)
+models_comparison <- rbind(models_comparison, data.table(model = c("chisq"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+```
+### Feature Selection: Information Gain
+
+```{r Information Gain}
+weights<- data.frame(information.gain(formula, train))
+weights$feature <- rownames(weights)
+weights[order(weights$attr_importance, decreasing = TRUE),]
+information_gain_features <- weights$feature[weights$attr_importance > 0.05]
+
+infgain <- train(Purchase ~ N_of_Categories + Cat_1_Group + Cat_2_Group + Cat_3_Group, 
+                       data = train, 
+                       method = "glm", 
+                       metric = "RMSE",
+                       preProc = c("center", "scale"),
+                       trControl=train_control_config)
+
+predictions_val <- predict(infgain, newdata = val)
+predictions_train <- predict(infgain, newdata = train)
+models_comparison <- rbind(models_comparison, data.table(model = c("info gain"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+```
+### Feature Selection: Wrapper Methods
+```{r Ridge Regression, warning=FALSE}
+lambdas <- 10^seq(-3, 0, by = .05)
+
+set.seed(121)
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     returnResamp = "all")
+
+ridge.mod <- train(formula, data = train, 
+               method = "glmnet", 
+               metric = "RMSE",
+               trControl=train_control_config,
+               tuneGrid = expand.grid(alpha = 1, lambda = lambdas))
+
+#The parameter `alpha = 0` means that we want to use the Ridge Regression way of expressing the penalty in regularization.
+
+predictions_val <- predict(ridge.mod, newdata = val)
+predictions_train <- predict(ridge.mod, newdata = train)
+models_comparison <- rbind(models_comparison, data.table(model = c("ridge"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+
+#Plotting the RMSE for the different lambda values, we can see the impact of this parameter in the model performance.
+plot(ridge.mod)
+#Plotting the coefficients for different lambda values. As expected the larger the lambda (lower Norm) value the smaller the coefficients of the features. However, as we can see at the top of the features, there is no feature selection
+plot(ridge.mod$finalModel)
+# Print, plot variable importance
+plot(varImp(ridge.mod), top = 20) # 20 most important features
+```
+```{r Lasso Regression, warning=FALSE}
+lambdas <- 10^seq(-3, 0, by = .05)
+
+set.seed(121)
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     returnResamp = "all")
+
+lasso.mod <- train(formula, data = train, 
+               method = "glmnet", 
+               metric = "RMSE",
+               trControl=train_control_config,
+               tuneGrid = expand.grid(alpha = 0, lambda = lambdas))
+
+#The parameter `alpha = 1` means that we want to use the Lasso Regression way of expressing the penalty in regularization.
+
+predictions_val <- predict(lasso.mod, newdata = val)
+predictions_train <- predict(lasso.mod, newdata = train)
+models_comparison <- rbind(models_comparison, data.table(model = c("lasso"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+
+#Plotting the RMSE for the different lambda values, we can see the impact of this parameter in the model performance.
+plot(lasso.mod)
+plot(lasso.mod$finalModel)
+# Print, plot variable importance
+plot(varImp(lasso.mod), top = 20) # 20 most important features
+```
+
+### Feature Selection: Embedded Methods
+```{r Backward Stepwise}
+
+train_control_config_4_stepwise <- trainControl(method = "none", classProbs = TRUE)
+
+backward.lm.mod <- train(formula, data = train, 
+               method = "glmStepAIC", 
+               direction = "backward",
+               trace = FALSE,
+               metric = "RMSE",
+               trControl=train_control_config_4_stepwise)
+
+paste("Features Selected" ,backward.lm.mod$finalModel$formula[3])
+
+predictions_val <- predict(backward.lm.mod, newdata = val)
+predictions_train <- predict(backward.lm.mod, newdata = train)
+models_comparison <- rbind(models_comparison, data.table(model = c("backward stepwise"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+```
+```{r Forward Stepwise}
+gc()
+
+train_control_config_4_stepwise <- trainControl(method = "none", classProbs = TRUE)
+
+forward.lm.mod <- train(formula, data = train, 
+               method = "lmStepAIC", 
+               direction = "forward",
+               trace = FALSE,
+               metric = "RMSE",
+               trControl=train_control_config_4_stepwise)
+
+paste("Features Selected" ,forward.lm.mod$finalModel$formula[3])
+
+predictions_val <- predict(forward.lm.mod, newdata = val)
+predictions_train <- predict(forward.lm.mod, newdata = train)
+models_comparison <- rbind(models_comparison, data.table(model = c("forward stepwise"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+```
+
+## Base R Partioning Tree
+```{r Base R Tree}
+gc()
+tree_0<-rpart(formula = formula, data = train, method = 'anova', model=TRUE)
+
+print(as.party(tree_0))
+
+rpart.plot(tree_0, digits = 4,type = 2,box.palette = 'Gn')
+
+predictions_train <- predict(tree_0, newdata = train,type = 'vector')
+predictions_val<-predict(tree_0, newdata = val,type = 'vector')
+
+models_comparison <- rbind(models_comparison, data.table(model = c("Base Tree"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+```
+
+## Random Forest
+```{r Random Forest}
+gc()
+train_control_config <- trainControl(method = "repeatedcv", 
+                                     number = 5, 
+                                     repeats = 1,
+                                     search = "grid")
+
+tunegrid <- expand.grid(mtry = c(2, 3, 4, 5),
+                       min.node.size = c(1, 3, 5),
+                       splitrule = c( "variance", "extratrees", "maxstat"))
+
+rf <- train(formula, 
+                       data = train, 
+                       method = "ranger", 
+                       metric = "RMSE",
+                       tuneGrid = tunegrid,
+                       trControl=train_control_config)
+
+predictions_val <- predict(rf, newdata = val)
+predictions_train <- predict(rf, newdata = train)
+models_comparison <- rbind(models_comparison,data.table(model = c("Random Forest"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+```
+
+
+## Boosting Regression
+```{r Boosting Regression}
+gc()
+xgbGrid <- expand.grid(nrounds = c(50,100), 
+                            lambda = seq(0.1, 0.5, 0.1), 
+                            alpha = seq(0.1, 0.5, 0.1),
+                            eta = c(0.3, 0.4))
+
+xgb_reg_0<-train(formula, data=train,
+                 method='xgbLinear',
+                 tuneGrid = xgbGrid,
+                trControl=train_control_config)
+
+predictions_val <- predict(xgb_reg_0, newdata = val)
+predictions_train <- predict(xgb_reg_0, newdata = train)
+models_comparison <- rbind(models_comparison,data.table(model = c("Boosting Regression"), mae_train = mae(train$Purchase, predictions_train), mape_train = mape(train$Purchase, predictions_train), rmse_train = rmse(train$Purchase, predictions_train),mae_val = mae(val$Purchase, predictions_val), mape_val = mape(val$Purchase, predictions_val), rmse_val = rmse(val$Purchase, predictions_val) ))
+models_comparison
+```
+
+## Model Selection
+Let's see a summary of the results obtained from the different models trained:
+```{r Models Comparison}
+models_comparison
+```
+
+The model with the best performance was the Boosting Regression. Now we will use the full training set to train the model and make predicstions on the test set.
+## Final Model
+Now let's use our entire training data to train our final model and make predictions on the test set:
+```{r Final Model}
+train <- dataset[-which(dataset$Purchase == 0),]
+
+gc()
+xgbGrid <- expand.grid(nrounds = c(50,100), 
+                            lambda = seq(0.1, 0.5, 0.1), 
+                            alpha = seq(0.1, 0.5, 0.1),
+                            eta = c(0.3, 0.4))
+
+xgb_reg_0<-train(formula, data=train,
+                 method='xgbLinear',
+                 tuneGrid = xgbGrid,
+                trControl=train_control_config)
+ 
+
+predictions <- predict(Final_Mode, new_data = test)
+
+submission <- data.frame(Id = original_test_data$User_Id, Purchase= (predictions))
+colnames(submission) <-c("User_Id", "Purchase")
+write.csv(submission, file = "BlackFridayPredictions.csv", row.names = FALSE) 
+```
+
